@@ -1,5 +1,5 @@
 extern crate anyhow;
-extern crate clap;
+#[macro_use] extern crate clap;
 extern crate env_logger;
 extern crate fuse;
 extern crate libc;
@@ -20,21 +20,26 @@ fn app<'a, 'b>() -> App<'a, 'b> {
     App::new(format!("plexfs {}", crate_version!()))
         .about("Mount a Plex server as a local filesystem.")
         .arg(Arg::with_name("version").short("v").long("version").help(
-            "Prints version info",
+            "Prints version info.",
         ))
         .arg(Arg::with_name("token").short("t").long("token").help(
             "Plex API token.",
-        ))
+        ).required(true).takes_value(true))
         .arg(Arg::with_name("host").short("h").long("host").help(
             "Plex server endpoint.",
-        ))
+        ).takes_value(true))
+        .arg(Arg::with_name("section").short("s").long("section").help(
+            "Plex library section. (integer)",
+        ).required(true).takes_value(true))
         .arg(Arg::with_name("mountpoint").index(1).required(true))
 }
 
 fn main() {
+    env_logger::init();
+
     let matches = app().get_matches();
     if matches.is_present("version") {
-        println!("reaktor-mapper {}", crate_version!());
+        println!("plexfs {}", crate_version!());
         return;
     }
 
@@ -43,23 +48,15 @@ fn main() {
         .parse()
         .unwrap();
     let token = matches.value_of("token")
-        .unwrap_or("")
+        .unwrap()
         .into();
-    let section = 10;
+    let section = value_t_or_exit!(matches, "section", u64);
     let media_kind = api::MediaKind::Music;
+    let mountpoint = matches.value_of("mountpoint").unwrap();
 
-    // {
-    //     let api = api::PlexAPI::new(host, token);
+    let fs = fs::PlexFS::new(host, token, 10, media_kind);
 
-    //     let container = api.metadata_children(20056).unwrap();
-    //     println!("{:?}", container);
-    // }
-
-    let fs = fs::PlexFS::new(host, token, section, media_kind);
-
-    env_logger::init();
-    let mountpoint = env::args_os().nth(1).unwrap();
-    let options = ["-d", "-o", "ro", "-o", "fsname=plex"]
+    let options = ["-o", "ro", "-o", "fsname=plex"]
         .iter()
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();

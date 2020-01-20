@@ -1,5 +1,6 @@
 use std::cmp;
-use std::ffi::OsStr;
+use std::collections::HashMap;
+use std::ffi::{OsString, OsStr};
 use std::net::SocketAddr;
 use std::time::{Duration, UNIX_EPOCH};
 use libc::ENOENT;
@@ -7,12 +8,21 @@ use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, Reply
 
 use super::api;
 
-const TTL: Duration = Duration::from_secs(1);           // 1 second
+const TTL: Duration = Duration::from_secs(60 * 60);
+
+const PAGE_SIZE: u64 = 50;
+
+struct Entry {
+    rating_key: u64,
+    kind: FileType,
+    attr: Option<FileAttr>
+}
 
 pub struct PlexFS {
     api: api::PlexAPI,
     section: u64,
-    kind: api::MediaKind
+    kind: api::MediaKind,
+    entries: HashMap<u64, HashMap<OsString, Entry>>,
 }
 
 impl PlexFS {
@@ -20,7 +30,8 @@ impl PlexFS {
         PlexFS {
             api: api::PlexAPI::new(host, token),
             section: section,
-            kind: kind
+            kind: kind,
+            entries: HashMap::new()
         }
     }
 }
@@ -36,7 +47,7 @@ const ROOT_DIR_ATTR: FileAttr = FileAttr {
     ctime: UNIX_EPOCH,
     crtime: UNIX_EPOCH,
     kind: FileType::Directory,
-    perm: 0o755,
+    perm: 0o444,
     nlink: 2,
     uid: 501,
     gid: 20,
@@ -67,7 +78,7 @@ fn to_attr(item: &api::Item) -> Option<FileAttr> {
                 ctime: ctime,
                 crtime: crtime,
                 kind: FileType::Directory,
-                perm: 0o644,
+                perm: 0o444,
                 nlink: 1,
                 uid: 501,
                 gid: 20,
@@ -88,7 +99,6 @@ fn to_attr(item: &api::Item) -> Option<FileAttr> {
             let ctime = UNIX_EPOCH + Duration::from_secs(*added_at);
             let crtime = ctime;
             let size = media.part.size;
-            println!("SIZE {}", size);
 
             Some(FileAttr {
                 ino: INO_ROOT + rating_key,
@@ -99,7 +109,7 @@ fn to_attr(item: &api::Item) -> Option<FileAttr> {
                 ctime: ctime,
                 crtime: crtime,
                 kind: FileType::RegularFile,
-                perm: 0o555,
+                perm: 0o444,
                 nlink: 1,
                 uid: 501,
                 gid: 20,
@@ -117,42 +127,24 @@ fn escape_name(s: &str) -> String {
 
 impl Filesystem for PlexFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        info!("lookup {} {:?}", parent, name);
+        debug!("lookup {} {:?}", parent, name);
 
-        let res = if parent == INO_ROOT {
-            self.api.all(self.section, self.kind)
-        } else {
-            self.api.metadata_children(parent - INO_ROOT)
-        };
-
-        match res {
-            Ok(container) => {
-                for item in container.items.iter() {
-                    let title = match item {
-                        api::Item::Directory { title, .. } => escape_name(title),
-                        api::Item::Video { title, .. } => escape_name(title),
-                        api::Item::Track { media, .. } => {
-                            let path = &media.part.file;
-                            path.split("/").last().unwrap().into()
-                        },
-                    };
-                    if name.to_str() == Some(&title) {
-                        println!("get {:?}", item);
-                        match to_attr(item) {
-                            Some(attr) => reply.entry(&TTL, &attr, 0),
-                            None => reply.error(ENOENT)
-                        }
-                        return
+        match self.entries.get(&parent) {
+            Some(names) => {
+                match names.get(name) {
+                    Some(entry) => match entry.attr {
+                        Some(attr) => reply.entry(&TTL, &attr, 0),
+                        None => reply.error(ENOENT)
                     }
+                    _ => reply.error(ENOENT)
                 }
-                reply.error(ENOENT);
-            },
-            Err(_) => reply.error(ENOENT)
+            }
+            None => reply.error(ENOENT)
         }
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        info!("getattr {}", ino);
+        debug!("getattr {}", ino);
 
         if ino == INO_ROOT {
             reply.attr(&TTL, &ROOT_DIR_ATTR);
@@ -173,12 +165,11 @@ impl Filesystem for PlexFS {
                 }
             },
             Err(_) => reply.error(ENOENT)
-
         }
     }
 
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, reply: ReplyData) {
-        info!("read {} {} {}", ino, offset, size);
+        debug!("read {} {} {}", ino, offset, size);
 
         if ino == INO_ROOT {
             reply.error(ENOENT);
@@ -191,7 +182,6 @@ impl Filesystem for PlexFS {
                     Some(item) => {
                         match item {
                             api::Item::Track { media, .. } => {
-                                println!("getfile");
                                 match self.api.file(&media.part, offset, size) {
                                     Ok(body) => reply.data(&body[0..cmp::min(size as usize, body.len())]),
                                     Err(_) => reply.error(ENOENT)
@@ -208,39 +198,66 @@ impl Filesystem for PlexFS {
     }
 
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        info!("readdir {} {}", ino, offset);
+        debug!("readdir {} {}", ino, offset);
 
-        let mut entries = vec![
-            (1, FileType::Directory, String::from(".")),
-            (1, FileType::Directory, String::from("..")),
-        ];
+        if !self.entries.contains_key(&ino) {
+            let mut en = HashMap::new();
 
-        let res = if ino == INO_ROOT {
-            self.api.all(self.section, self.kind)
-        } else {
-            self.api.metadata_children(ino - INO_ROOT)
-        };
+            let mut containers = vec![];
 
-        if let Ok(container) = res {
-            for item in container.items.iter() {
-                match item {
-                    api::Item::Directory { rating_key, title, .. } => {
-                        entries.push((INO_ROOT + rating_key, FileType::Directory, escape_name(title)))
-                    },
-                    api::Item::Track { rating_key, media, .. } => {
-                        let path = &media.part.file;
-                        let filename = path.split("/").last().unwrap().into();
-                        entries.push((INO_ROOT + rating_key, FileType::RegularFile, filename))
+            if ino == INO_ROOT {
+                let mut start = 0;
+                if let Ok((first, size)) = self.api.all(self.section, self.kind, start, PAGE_SIZE) {
+                    containers.push(first);
+                    start += PAGE_SIZE;
+                    while start < size {
+                        if let Ok((container, _)) = self.api.all(self.section, self.kind, start, PAGE_SIZE) {
+                            containers.push(container);
+                        }
+                        start += PAGE_SIZE;
                     }
-                    _ => ()
+                }
+            } else {
+                let mut start = 0;
+                if let Ok((first, size)) = self.api.metadata_children(ino - INO_ROOT, start, PAGE_SIZE) {
+                    containers.push(first);
+                    start += PAGE_SIZE;
+                    while start < size {
+                        if let Ok((container, _)) = self.api.metadata_children(ino - INO_ROOT, start, PAGE_SIZE) {
+                            containers.push(container);
+                        }
+                        start += PAGE_SIZE;
+                    }
                 }
             }
+
+            for container in containers.iter() {
+                for item in container.items.iter() {
+                    let attr = to_attr(&item);
+
+                    match item {
+                        api::Item::Directory { rating_key, title, .. } => {
+                            en.insert(OsString::from(escape_name(title)), Entry {rating_key: *rating_key, kind: FileType::RegularFile, attr: attr});
+                        },
+                        api::Item::Track { rating_key, media, .. } => {
+                            let path = &media.part.file;
+                            let filename: String = path.split("/").last().unwrap().into();
+                            en.insert(OsString::from(filename), Entry {rating_key: *rating_key, kind: FileType::RegularFile, attr: attr});
+                        },
+                        _ => ()
+                    }
+                }
+            }
+
+            self.entries.insert(ino, en);
         }
 
-        for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-            // i + 1 means the index of the next entry
-            reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2);
+        let entries = self.entries.get(&ino).unwrap();
+
+        for (i, (name, entry)) in entries.iter().enumerate().skip(offset as usize) {
+            reply.add(INO_ROOT + entry.rating_key, (i + 1) as i64, entry.kind, name);
         }
+
         reply.ok();
     }
 }
