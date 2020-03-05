@@ -54,7 +54,7 @@ fn main() {
     let media_kind = api::MediaKind::Music;
     let mountpoint = matches.value_of("mountpoint").unwrap();
 
-    let fs = fs::PlexFS::new(host, token, 10, media_kind);
+    let fs = fs::PlexFS::new(host, token, section, media_kind);
 
     let options = ["-o", "ro", "-o", "fsname=plex"]
         .iter()
